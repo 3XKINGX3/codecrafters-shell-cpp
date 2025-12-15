@@ -11,7 +11,9 @@
 #include <pwd.h>
 #include <sys/wait.h>
 #include <fcntl.h>
+
 using namespace std;
+
 namespace fs = std::filesystem;
 
 // FUSE VFS functions
@@ -30,185 +32,152 @@ int main() {
     fs::path users_dir = fs::current_path() / "users";
     try {
         if (!fs::exists(users_dir)) {
-            fs::create_directories(users_dir);
+            fs::create_directory(users_dir);
         }
-    } catch (...) {}
-    
-    start_users_vfs(users_dir.string().c_str());
+    } catch (const fs::filesystem_error& e) {
+        cerr << "Error creating users directory: " << e.what() << endl;
+        return 1;
+    }
 
+    // Signal handling
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = handle_sighup;
-    sigemptyset(&sa.sa_mask);
-    sa.sa_flags = SA_RESTART;
     sigaction(SIGHUP, &sa, NULL);
 
-    cout << unitbuf;    
+    // Main shell loop
     string input;
-   
-    const char* home_dir = getenv("HOME");
-    string history_file;
-   
-    if(home_dir !=nullptr) {
-        history_file = string(home_dir) + "/kubsh_history";
-    } else {
-        history_file = "/kubsh_history";
-    }
+    while (true) {
+        // Display prompt
+        cout << "$ ";
+        cout.flush();
 
-    while(true) {
-        if (isatty(STDIN_FILENO)) {
-            cout << "$ ";
-        }
-        
-        if(!getline(cin, input)) {
-            if (cin.eof()) break;
-            cin.clear();
+        // Read input
+        if (!getline(cin, input)) {
+            if (cin.eof()) {
+                cout << endl;
+                break;
+            }
             continue;
         }
 
-        // Выход
-        if(input == "\\q") {
-            stop_users_vfs();
-            return 0;
+        // Trim whitespace
+        size_t start = input.find_first_not_of(" \t\n\r");
+        if (start == string::npos) {
+            continue; // Empty line
         }
+        size_t end = input.find_last_not_of(" \t\n\r");
+        input = input.substr(start, end - start + 1);
 
-        // Парсинг аргументов (ОДИН раз!)
+        // Parse command
+        istringstream iss(input);
         vector<string> args;
-        string current_arg;
-        bool in_quotes = false;
-        
-        for(char c : input) {
-            if(c == '\'') {
-                in_quotes = !in_quotes;
-            } else if(c == ' ' && !in_quotes) {
-                if(!current_arg.empty()) {
-                    args.push_back(current_arg);
-                    current_arg.clear();
-                }
-            } else {
-                current_arg += c;
-            }
-        }
-        if(!current_arg.empty()) {
-            args.push_back(current_arg);
+        string arg;
+        while (iss >> quoted(arg)) {
+            args.push_back(arg);
         }
 
-        if (args.empty()) continue;
-        
+        if (args.empty()) {
+            continue;
+        }
+
         string cmdName = args[0];
 
-        // Сохраняем в историю (кроме специальных команд)
-        if(!input.empty() && input != "history") {
-            ofstream file(history_file, ios::app);
-            file << input << endl;
+        // Handle built-in commands
+        if (cmdName == "exit") {
+            stop_users_vfs();
+            break;
         }
-
-        // Builtin команды
-        if (cmdName == "history") {
-            ifstream read_file(history_file);
-            string line;
-            while(getline(read_file, line)) {
-                cout << " " << line << endl;
-            }
-            continue;
-        } 
-        else if (cmdName == "echo" || cmdName == "debug") {
-            for(size_t i = 1; i < args.size(); ++i) {
-                cout << args[i] << (i == args.size() - 1 ? "" : " ");
+        else if (cmdName == "echo") {
+            for (size_t i = 1; i < args.size(); ++i) {
+                cout << args[i];
+                if (i < args.size() - 1) {
+                    cout << " ";
+                }
             }
             cout << endl;
-            continue;
         }
-        else if (cmdName == "\\e") {
-            if (args.size() == 1) {
-                // Вывести все переменные окружения
-                extern char **environ;
-                for (char **env = environ; *env != nullptr; env++) {
-                    cout << *env << endl;
-                }
-            } else if (args.size() > 1) {
-                string var = args[1];
-                if (var.size() > 0 && var[0] == '$') {
-                    var = var.substr(1);
-                }
-                const char* env_val = getenv(var.c_str());
-                if (env_val) {
-                    string val = env_val;
-                    size_t start = 0;
-                    size_t end = val.find(':');
-                    while (end != string::npos) {
-                        cout << val.substr(start, end - start) << endl;
-                        start = end + 1;
-                        end = val.find(':', start);
-                    }
-                    cout << val.substr(start) << endl;
+        else if (cmdName == "echo" || cmdName == "debug") {
+            // This might be a duplicate - check what you need here
+            for (size_t i = 1; i < args.size(); ++i) {
+                cout << args[i];
+                if (i < args.size() - 1) {
+                    cout << " ";
                 }
             }
-            continue;
+            cout << endl;
         }
-        else if (cmdName == "\\l") {
+        else if (cmdName == "type") {
             if (args.size() < 2) {
-                cerr << "Usage: \\l <device>" << endl;
+                cout << "type: missing argument" << endl;
+                continue;
+            }
+            string cmdToCheck = args[1];
+            // Check if it's a built-in
+            if (cmdToCheck == "exit" || cmdToCheck == "echo" || 
+                cmdToCheck == "type" || cmdToCheck == "pwd") {
+                cout << cmdToCheck << " is a shell builtin" << endl;
             } else {
-                string device = args[1];
-                ifstream dev_file(device, ios::binary);
-                if (!dev_file) {
-                    cerr << "Failed to open device: " << device << endl;
-                } else {
-                    uint8_t mbr[512];
-                    if (!dev_file.read(reinterpret_cast<char*>(mbr), 512)) {
-                        cerr << "Failed to read MBR" << endl;
-                    } else {
-                        if (mbr[510] != 0x55 || mbr[511] != 0xAA) {
-                            cerr << "Invalid MBR signature" << endl;
-                        } else {
-                            cout << "Partition table for " << device << ":" << endl;
-                            cout << "Boot Start LBA Size Type" << endl;
-                            for (int i = 0; i < 4; ++i) {
-                                int offset = 446 + i * 16;
-                                uint8_t status = mbr[offset];
-                                uint8_t type = mbr[offset + 4];
-                                uint32_t lba_start = *reinterpret_cast<uint32_t*>(&mbr[offset + 8]);
-                                uint32_t size = *reinterpret_cast<uint32_t*>(&mbr[offset + 12]);
-                                
-                                cout << (status == 0x80 ? "*" : " ") << "    "
-                                     << setw(10) << lba_start << " "
-                                     << setw(10) << size << " "
-                                     << hex << setw(2) << setfill('0') << (int)type << dec << setfill(' ') << endl;
-                            }
+                // Check if it's in PATH
+                char* path = getenv("PATH");
+                if (path) {
+                    string pathStr(path);
+                    istringstream pathStream(pathStr);
+                    string dir;
+                    bool found = false;
+                    while (getline(pathStream, dir, ':')) {
+                        fs::path cmdPath = dir / cmdToCheck;
+                        if (fs::exists(cmdPath) && 
+                            (fs::status(cmdPath).permissions() & fs::perms::owner_exec) != fs::perms::none) {
+                            cout << cmdToCheck << " is " << cmdPath.string() << endl;
+                            found = true;
+                            break;
                         }
                     }
+                    if (!found) {
+                        cout << cmdToCheck << ": not found" << endl;
+                    }
+                } else {
+                    cout << cmdToCheck << ": not found" << endl;
                 }
             }
-            continue;
         }
-        
-        // ВСЕ остальные команды - внешние (fork/exec)
-        pid_t pid = fork();
-        if (pid == 0) {
-            // Дочерний процесс
-            vector<char*> c_args;
-            for(const auto& arg : args) {
-                c_args.push_back(const_cast<char*>(arg.c_str()));
-            }
-            c_args.push_back(nullptr);
-            
-            execvp(c_args[0], c_args.data());
-            
-            // Если execvp вернул ошибку
-            cerr << input << ": command not found" << endl;
-            exit(127);  // Важно: 127 для "command not found"
-        } 
-        else if (pid > 0) {
-            // Родительский процесс
-            int status;
-            waitpid(pid, &status, 0);
-        } 
+        else if (cmdName == "pwd") {
+            cout << fs::current_path().string() << endl;
+        }
         else {
-            cerr << "Fork failed" << endl;
+            // External command execution
+            pid_t pid = fork();
+            if (pid == 0) {
+                // Child process
+                vector<char*> argv;
+                for (auto& arg : args) {
+                    argv.push_back(const_cast<char*>(arg.c_str()));
+                }
+                argv.push_back(nullptr);
+                
+                execvp(argv[0], argv.data());
+                
+                // If execvp returns, there was an error
+                cerr << args[0] << ": command not found" << endl;
+                exit(1);
+            } else if (pid > 0) {
+                // Parent process
+                int status;
+                waitpid(pid, &status, 0);
+            } else {
+                cerr << "Failed to fork" << endl;
+            }
         }
     }
-    
-    stop_users_vfs();
+
     return 0;
+}
+
+// Check MBR signature function
+bool check_mbr_signature(const unsigned char* mbr) {
+    if (mbr[510] != 0x55 || mbr[511] != 0xAA) {
+        return false;
+    }
+    return true;
 }
