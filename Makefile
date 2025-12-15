@@ -7,6 +7,7 @@ TARGET = kubsh
 
 PKG_DIR = kubsh-package
 PKG_BIN = $(PKG_DIR)/usr/bin
+PKG_DEBIAN = $(PKG_DIR)/DEBIAN
 DEB_NAME = kubsh_1.0_amd64.deb
 
 .PHONY: build run deb clean
@@ -25,8 +26,17 @@ run: $(TARGET)
 deb: build
 	@echo "==> Preparing package directory"
 	mkdir -p $(PKG_BIN)
+	mkdir -p $(PKG_DEBIAN)
 	cp $(TARGET) $(PKG_BIN)/
 	chmod 755 $(PKG_BIN)/$(TARGET)
+	
+	@echo "==> Creating control file"
+	echo "Package: kubsh" > $(PKG_DEBIAN)/control
+	echo "Version: 1.0" >> $(PKG_DEBIAN)/control
+	echo "Architecture: amd64" >> $(PKG_DEBIAN)/control
+	echo "Maintainer: Shell Developer <dev@example.com>" >> $(PKG_DEBIAN)/control
+	echo "Description: Custom shell with VFS support" >> $(PKG_DEBIAN)/control
+	echo " A C++ shell implementation with FUSE VFS for user management." >> $(PKG_DEBIAN)/control
 
 	@echo "==> Building .deb package"
 	dpkg-deb --build $(PKG_DIR) $(DEB_NAME)
@@ -36,3 +46,4 @@ deb: build
 clean:
 	rm -f $(TARGET)
 	rm -f kubsh_*.deb
+	rm -rf $(PKG_DIR)
