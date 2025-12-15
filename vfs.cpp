@@ -31,17 +31,13 @@ void update_users_cache() {
     struct passwd *pw;
     setpwent();
     while ((pw = getpwent()) != NULL) {
-        if (pw->pw_shell != nullptr) {
-            std::string shell = pw->pw_shell;
-            if (shell.length() >= 2 && shell.substr(shell.length() - 2) == "sh") {
-                UserInfo user;
-                user.name = pw->pw_name;
-                user.uid = pw->pw_uid;
-                user.home = pw->pw_dir;
-                user.shell = pw->pw_shell;
-                users_cache.push_back(user);
-            }
-        }
+        // БЕРЁМ ВСЕХ пользователей (без фильтрации по shell)
+        UserInfo user;
+        user.name = pw->pw_name;
+        user.uid = pw->pw_uid;
+        user.home = pw->pw_dir ? pw->pw_dir : "";
+        user.shell = pw->pw_shell ? pw->pw_shell : "";
+        users_cache.push_back(user);
     }
     endpwent();
 }
@@ -332,7 +328,7 @@ extern "C" int start_users_vfs(const char *mount_point) {
         };
         
         init_fuse_operations();
-        update_users_cache();
+        update_users_cache();  // Важно: кэшируем всех пользователей
         
         int ret = fuse_main(4, fuse_argv, &users_oper, NULL);
         exit(ret);
