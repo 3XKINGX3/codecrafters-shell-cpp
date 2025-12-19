@@ -1,351 +1,317 @@
-#define FUSE_USE_VERSION 31
+#define FUSE_USE_VERSION 35
 
-#include <fuse3/fuse.h>
-#include <string.h>
-#include <errno.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <pwd.h>
-#include <unistd.h>
-#include <stdlib.h>
-#include <sys/wait.h>
-#include <signal.h>
-#include <stdio.h>
-#include <vector>
+#include <unistd.h>//fork в run_cmd
+#include <cstdlib>//NULL 
+#include <cstring>//Работа с C-строками
+#include <pwd.h>//Работа с pwd
+#include <sys/types.h>//Определение типов pid_t и других
+#include <cerrno>//Константы для ошибок
+#include <ctime>//Время для getattr
 #include <string>
+#include "vfs.hpp"//Для передачи fuse_start в main
+#include <sys/wait.h>//waitpid
+#include <fuse3/fuse.h>
+#include <pthread.h>//Потоки
 
-static int vfs_pid = -1;
-
-struct UserInfo {
-    std::string name;
-    uid_t uid;
-    std::string home;
-    std::string shell;
-};
-
-static std::vector<UserInfo> users_cache;
-
-void update_users_cache() {
-    users_cache.clear();
-    
-    struct passwd *pw;
-    setpwent();
-    while ((pw = getpwent()) != NULL) {
-        // БЕРЁМ ВСЕХ пользователей (без фильтрации по shell)
-        UserInfo user;
-        user.name = pw->pw_name;
-        user.uid = pw->pw_uid;
-        user.home = pw->pw_dir ? pw->pw_dir : "";
-        user.shell = pw->pw_shell ? pw->pw_shell : "";
-        users_cache.push_back(user);
-    }
-    endpwent();
-}
-
-static int users_getattr(const char *path, struct stat *stbuf, struct fuse_file_info *fi) {
-    (void) fi;
-    memset(stbuf, 0, sizeof(struct stat));
-    
-    if (strcmp(path, "/") == 0) {
-        stbuf->st_mode = S_IFDIR | 0755;
-        stbuf->st_nlink = 2;
-        return 0;
-    }
-    
-    // Parse path: /username or /username/file
-    std::string pathstr = path;
-    if (pathstr[0] == '/') pathstr = pathstr.substr(1);
-    
-    size_t slash_pos = pathstr.find('/');
-    std::string username = (slash_pos == std::string::npos) ? pathstr : pathstr.substr(0, slash_pos);
-    
-    // Find user
-    const UserInfo* user = nullptr;
-    for (const auto& u : users_cache) {
-        if (u.name == username) {
-            user = &u;
-            break;
-        }
-    }
-    
-    if (!user) return -ENOENT;
-    
-    if (slash_pos == std::string::npos) {
-        // Directory /username
-        stbuf->st_mode = S_IFDIR | 0755;
-        stbuf->st_nlink = 2;
-        return 0;
-    }
-    
-    // File /username/prop
-    std::string prop = pathstr.substr(slash_pos + 1);
-    if (prop == "id" || prop == "home" || prop == "shell") {
-        stbuf->st_mode = S_IFREG | 0444;
-        stbuf->st_nlink = 1;
-        
-        if (prop == "id") {
-            stbuf->st_size = std::to_string(user->uid).length();
-        } else if (prop == "home") {
-            stbuf->st_size = user->home.length();
-        } else if (prop == "shell") {
-            stbuf->st_size = user->shell.length();
-        }
-        return 0;
-    }
-    
-    return -ENOENT;
-}
-
-static int users_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
-                        off_t offset, struct fuse_file_info *fi,
-                        enum fuse_readdir_flags flags) {
-    (void) offset;
-    (void) fi;
-    (void) flags;
-    
-    if (strcmp(path, "/") == 0) {
-        filler(buf, ".", NULL, 0, FUSE_FILL_DIR_PLUS);
-        filler(buf, "..", NULL, 0, FUSE_FILL_DIR_PLUS);
-        
-        for (const auto& user : users_cache) {
-            filler(buf, user.name.c_str(), NULL, 0, FUSE_FILL_DIR_PLUS);
-        }
-        return 0;
-    }
-    
-    // Directory /username
-    std::string pathstr = path;
-    if (pathstr[0] == '/') pathstr = pathstr.substr(1);
-    
-    // Check if user exists
-    bool found = false;
-    for (const auto& user : users_cache) {
-        if (user.name == pathstr) {
-            found = true;
-            break;
-        }
-    }
-    
-    if (found) {
-        filler(buf, ".", NULL, 0, FUSE_FILL_DIR_PLUS);
-        filler(buf, "..", NULL, 0, FUSE_FILL_DIR_PLUS);
-        filler(buf, "id", NULL, 0, FUSE_FILL_DIR_PLUS);
-        filler(buf, "home", NULL, 0, FUSE_FILL_DIR_PLUS);
-        filler(buf, "shell", NULL, 0, FUSE_FILL_DIR_PLUS);
-        return 0;
-    }
-    
-    return -ENOENT;
-}
-
-static int users_open(const char *path, struct fuse_file_info *fi) {
-    std::string pathstr = path;
-    if (pathstr[0] == '/') pathstr = pathstr.substr(1);
-    
-    size_t slash_pos = pathstr.find('/');
-    if (slash_pos == std::string::npos) return -EISDIR;
-    
-    std::string username = pathstr.substr(0, slash_pos);
-    std::string prop = pathstr.substr(slash_pos + 1);
-    
-    if (prop != "id" && prop != "home" && prop != "shell") {
-        return -ENOENT;
-    }
-    
-    if ((fi->flags & O_ACCMODE) != O_RDONLY) {
-        return -EACCES;
-    }
-    
-    return 0;
-}
-
-static int users_read(const char *path, char *buf, size_t size, off_t offset,
-                     struct fuse_file_info *fi) {
-    (void) fi;
-    
-    std::string pathstr = path;
-    if (pathstr[0] == '/') pathstr = pathstr.substr(1);
-    
-    size_t slash_pos = pathstr.find('/');
-    if (slash_pos == std::string::npos) return -EISDIR;
-    
-    std::string username = pathstr.substr(0, slash_pos);
-    std::string prop = pathstr.substr(slash_pos + 1);
-    
-    // Find user
-    const UserInfo* user = nullptr;
-    for (const auto& u : users_cache) {
-        if (u.name == username) {
-            user = &u;
-            break;
-        }
-    }
-    
-    if (!user) return -ENOENT;
-    
-    std::string content;
-    if (prop == "id") {
-        content = std::to_string(user->uid);
-    } else if (prop == "home") {
-        content = user->home;
-    } else if (prop == "shell") {
-        content = user->shell;
-    } else {
-        return -ENOENT;
-    }
-    
-    size_t len = content.length();
-    if (offset < (off_t)len) {
-        if (offset + size > len) {
-            size = len - offset;
-        }
-        memcpy(buf, content.c_str() + offset, size);
-    } else {
-        size = 0;
-    }
-    
-    return size;
-}
-
-static int users_mkdir(const char *path, mode_t mode) {
-    (void) mode;
-    
-    std::string pathstr = path;
-    if (pathstr[0] == '/') pathstr = pathstr.substr(1);
-    
-    // Should be /username only
-    if (pathstr.find('/') != std::string::npos) {
-        return -EACCES;
-    }
-    
-    std::string username = pathstr;
-    
-    // Check if user already exists
-    struct passwd *pw = getpwnam(username.c_str());
-    if (pw != NULL) {
-        update_users_cache();
-        return 0;  // User exists, just update cache
-    }
-    
-    // Create user synchronously
+int run_cmd(const char* cmd, char* const argv[]) {
     pid_t pid = fork();
+
     if (pid == 0) {
-        // Child process
-        int devnull = open("/dev/null", O_WRONLY);
-        if (devnull >= 0) {
-            dup2(devnull, STDOUT_FILENO);
-            dup2(devnull, STDERR_FILENO);
-            close(devnull);
-        }
-        
-        execlp("useradd", "useradd", "-m", username.c_str(), (char*)NULL);
-        _exit(1);
-    } else if (pid > 0) {
-        // Parent: wait for completion
-        int status;
-        waitpid(pid, &status, 0);
-        
-        if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
-            // Success - update cache
-            update_users_cache();
-            return 0;
-        }
-        
-        return -EIO;
+        execvp(cmd, argv);//Выполнили - отдали управление
+        _exit(127);//Иначе ошибка
     }
-    
-    return -EIO;
-}
 
-static int users_rmdir(const char *path) {
-    std::string pathstr = path;
-    if (pathstr[0] == '/') pathstr = pathstr.substr(1);
-    
-    // Should be /username only (no nested paths)
-    if (pathstr.find('/') != std::string::npos) {
-        return -EACCES;
-    }
-    
-    std::string username = pathstr;
-    
-    // Check if user exists
-    struct passwd *pw = getpwnam(username.c_str());
-    if (pw == NULL) {
-        return -ENOENT;  // User doesn't exist
-    }
-    
-    // Delete user synchronously
-    pid_t pid = fork();
-    if (pid == 0) {
-        // Child process
-        int devnull = open("/dev/null", O_WRONLY);
-        if (devnull >= 0) {
-            dup2(devnull, STDOUT_FILENO);
-            dup2(devnull, STDERR_FILENO);
-            close(devnull);
-        }
-        
-        execlp("userdel", "userdel", "-r", username.c_str(), (char*)NULL);
-        _exit(1);
-    } else if (pid > 0) {
-        // Parent: wait for completion
-        int status;
-        waitpid(pid, &status, 0);
-        
-        if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
-            // Success - update cache
-            update_users_cache();
-            return 0;
-        }
-        
-        return -EIO;
-    }
-    
-    return -EIO;
-}
+    int status = 0;
+    waitpid(pid, &status, 0);
 
-static struct fuse_operations users_oper{};
-
-void init_fuse_operations() {
-    users_oper.getattr = users_getattr;
-    users_oper.mkdir = users_mkdir;
-    users_oper.rmdir = users_rmdir;
-    users_oper.open = users_open;
-    users_oper.read = users_read;
-    users_oper.readdir = users_readdir;
-}
-
-extern "C" int start_users_vfs(const char *mount_point) {
-    int pid = fork();
-    if (pid == 0) {
-        // Child process - run FUSE
-        char *fuse_argv[] = {
-            (char*)"users_vfs",
-            (char*)"-f",           // foreground
-            (char*)"-s",           // single-threaded
-            (char*)mount_point,
-            NULL
-        };
-        
-        init_fuse_operations();
-        update_users_cache();  // Важно: кэшируем всех пользователей
-        
-        int ret = fuse_main(4, fuse_argv, &users_oper, NULL);
-        exit(ret);
-    } else if (pid > 0) {
-        vfs_pid = pid;
-        // Give FUSE time to initialize
-        usleep(100000);  // 100ms
+    //Проверка завершения процесса и статуса, если все хорошо то return 0 иначе ошибка -1
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 0)
         return 0;
-    }
-    
+
     return -1;
 }
 
-extern "C" void stop_users_vfs() {
-    if (vfs_pid != -1) {
-        kill(vfs_pid, SIGTERM);
-        waitpid(vfs_pid, NULL, 0);
-        vfs_pid = -1;
+//Для проверки на "правильность" шелла
+//pwd - структура passwd, в которой есть указатели на конкретные данные из файла
+bool valid_shell(struct passwd* pwd)
+{
+    if (!pwd || !pwd->pw_shell) 
+        return false;
+    size_t len = strlen(pwd->pw_shell);
+    //Если название шелла >=2 и последние 2 символа в названии == sh 
+    return (len >= 2 && strcmp(pwd->pw_shell + len - 2, "sh") == 0);
+}
+
+
+//Проверка существования пути, получения прав доступа
+int users_getattr(const char* path, struct stat* st, struct fuse_file_info* fi) {
+    (void) fi;
+    //Обнуление полей st
+    memset(st, 0, sizeof(struct stat));
+    
+    //Ставим время изменения, доступа и модификации на текущее
+    time_t now = time(NULL);
+    st->st_atime = st->st_mtime = st->st_ctime = now;
+
+    //Если корневая директория - владелец текущий пользователь
+    if (strcmp(path, "/") == 0) {
+        st->st_mode = S_IFDIR | 0755;//Права rwxr-xr-x
+        st->st_uid = getuid();
+        st->st_gid = getgid();
+        return 0;
     }
+
+    char username[256];
+    char filename[256];
+
+    //Файлы в директориях пользователей
+    //Разбиваем path на /...(255)/...
+    //Если удачно то кладем первую часть в username, вторую в filename 
+    if (sscanf(path, "/%255[^/]/%255[^/]", username, filename) == 2) {
+        //getpwnam ищем в pwd пользователя username
+        struct passwd* pwd = getpwnam(username);
+
+        //Если файл это id/home/shell, иначе файл не найден
+        if (strcmp(filename, "id") != 0 &&
+                    strcmp(filename, "home") != 0 &&
+                    strcmp(filename, "shell") != 0) {
+                    return -ENOENT;
+                }
+
+        //Если нашли в pwd(то есть не NULL)
+        if (pwd != NULL) {
+            st->st_mode = S_IFREG | 0644;//Обычный файл с правами rw-r--r--
+            st->st_uid = pwd->pw_uid;  //Владелец - пользователь
+            st->st_gid = pwd->pw_gid;
+            st->st_size = 256;//Размер файла 256 байт
+            return 0;
+        }
+        return -ENOENT;
+    }
+
+    //Директории пользователей
+    //Если разбили path только на /...
+    if (sscanf(path, "/%255[^/]", username) == 1) {
+        struct passwd* pwd = getpwnam(username);
+        if (pwd != NULL) {
+            st->st_mode = S_IFDIR | 0755;
+            st->st_uid = pwd->pw_uid;  //Владелец - пользователь
+            st->st_gid = pwd->pw_gid;
+            return 0;
+        }
+        return -ENOENT;
+    }
+
+    return -ENOENT;
+}
+
+
+int users_readdir(
+    const char* path,
+    void* buf, 
+    fuse_fill_dir_t filler, 
+    off_t offset, 
+    struct fuse_file_info* fi, 
+    enum fuse_readdir_flags flags
+) {
+    (void) offset;
+    (void) fi;
+    (void) flags;
+
+
+    //filler - функция, которая добавляет одну запись в виртуальную директорию
+    filler(buf, ".", NULL, 0, FUSE_FILL_DIR_PLUS);
+    filler(buf, "..", NULL, 0, FUSE_FILL_DIR_PLUS);
+
+    //Если в корне, то смотрим все user'ов в passwd, и пока находим новых проверяем их на шелл
+    //и заполняем buf в который ложим записи 
+    if (std::strcmp(path, "/") == 0) {
+        struct passwd* pwd;
+        setpwent();
+
+        while ((pwd = getpwent()) != NULL) {
+            if (valid_shell(pwd)) {
+                //buf - буфер куда ложим записи, pwd->pw_name - имя файла или директории
+                filler(buf, pwd->pw_name, NULL, 0, FUSE_FILL_DIR_PLUS);
+            }
+        }
+
+        endpwent();
+        return 0;
+    }
+
+    char username[256] = {0};
+    if (sscanf(path, "/%255[^/]", username) == 1) {
+        struct passwd* pwd = getpwnam(username);
+        if (pwd!=NULL) {
+            //Складываем все файлы в каждом user в буфер
+            filler(buf, "id", NULL, 0, FUSE_FILL_DIR_PLUS);
+            filler(buf, "home", NULL, 0, FUSE_FILL_DIR_PLUS);
+            filler(buf, "shell", NULL, 0, FUSE_FILL_DIR_PLUS);
+            return 0;
+        }
+    }
+    //После отработки функции все что было в buf отправится в файловую систему
+    return -ENOENT;
+}
+
+
+
+int users_read(const char* path, char* buf, size_t size, off_t offset, struct fuse_file_info* fi) {
+    (void) fi;
+
+    char username[256];
+    char filename[256];
+
+    //Разбиваем path на 2 части:имя и файл(id/dir/shell)
+    std::sscanf(path, "/%255[^/]/%255[^/]", username, filename);
+
+    //Ищем в pwd информацию о username
+    struct passwd* pwd = getpwnam(username);
+    if(!pwd) return -ENOENT;
+    
+    char content[256];
+    content[0] = '\0';
+
+    if (std::strcmp(filename, "id") == 0) {
+        //content - куда записываем, 256 байт максимум,%d - целое число, берем из pw_uid
+        std::snprintf(content, sizeof(content), "%d", pwd->pw_uid);
+    }
+    else if (std::strcmp(filename, "home") == 0) {
+        //%s - строка
+        std::snprintf(content, sizeof(content), "%s", pwd->pw_dir);
+    }
+    else {
+        std::snprintf(content, sizeof(content), "%s", pwd->pw_shell);
+    }
+
+    size_t len = std::strlen(content);
+    if (len > 0 && content[len-1] == '\n') {
+        content[len-1] = '\0';
+        len--;
+    }
+
+    //Проверка чтобы не читали за пределом файла
+    if ((size_t)offset >= len) {
+        return 0;
+    }
+
+    //Указываем сколько байт можно прочитать
+    if (offset + size > len) {
+        size = len - offset;
+    }
+
+    //Копируем данные в буфер 
+    std::memcpy(buf, content + offset, size);
+    //Возврат сколько байт прочитали
+    return size;
+}
+
+int users_mkdir(const char* path, mode_t mode) {
+    (void) mode;
+
+    char username[256];
+
+    //Если извлекли только имя пользователя из path
+    if (std::sscanf(path, "/%255[^/]", username) == 1) {
+        //Открываем pwd и ищем username
+        struct passwd* pwd = getpwnam(username);
+        
+        //Возврат если такой пользователь уже существует 
+        if (pwd != NULL) {
+            return -EEXIST;
+        }
+
+        //Строки которые передадим для выполнения через run_cmd (fork)  
+        char* const argv[] = {(char*)"adduser", (char*)"--disabled-password",
+                      (char*)"--gecos", (char*)"", (char*)username, NULL};
+
+        if (run_cmd("adduser", argv) != 0) return -EIO;
+
+    }
+
+    return 0;
+}
+
+
+int users_rmdir(const char* path) {
+    char username[256];
+    //Если извлекли только имя пользователя из path
+    if (std::sscanf(path, "/%255[^/]", username) == 1) {
+        //Проверка есть ли вложенные файлы в path
+        //Если не находим "/"" в path не считая первый(/.../ <--типо такого)
+        if (std::strchr(path + 1, '/') == NULL) {
+            struct passwd* pwd = getpwnam(username);
+            if (pwd != NULL) {
+
+                char* const argv[] = {(char*)"userdel", (char*)"--remove", (char*)username, NULL};
+
+                if (run_cmd("userdel", argv) != 0) return -EIO;
+
+                return -EIO;
+            }
+            return -ENOENT;
+        }
+        return -EPERM;
+    }
+    return -EPERM;
+}
+
+//Структура в которой описаны функции которые переопределим для vfs
+//Инициализирую все нулями, потом с помощью функции переопределю нужные 5
+struct fuse_operations users_operations = {};
+
+void init_users_operations() {
+    users_operations.getattr = users_getattr;
+    users_operations.readdir = users_readdir;
+    users_operations.mkdir   = users_mkdir;
+    users_operations.rmdir   = users_rmdir;
+    users_operations.read    = users_read;
+}
+
+
+void* fuse_thread_function(void* arg) {
+    (void) arg;
+
+    //Вызов функции для инициализации
+    init_users_operations();
+
+    //Отключение лишних логов
+    int devnull = open("/dev/null", O_WRONLY);
+    int olderr = dup(STDERR_FILENO);
+    dup2(devnull, STDERR_FILENO);
+    close(devnull);
+
+    //Аргументы для fuse_main
+     char* fuse_argv[]={
+        (char*) "kubsh",//Имя программы
+        (char*) "-f",
+        (char*) "-odefault_permissions",//Стандартные права доступа
+        (char*) "-oauto_unmount",//Автоматическое размонтирование(возможно не нужно так как users создается при каждом запуске контейнера заново)
+        (char*) "/opt/users"//Куда монтируем
+    };
+
+    //Количество аргументов
+    int fuse_argc = sizeof(fuse_argv) / sizeof(fuse_argv[0]);
+
+    //Первые два аргумента - передаем запуск будто из командой строки
+    //users_operations - структура с функциями
+    //Последний аргумент нам не нужен
+    fuse_main(fuse_argc,(char**)fuse_argv,&users_operations,nullptr);
+
+    //Возврат логов
+    dup2(olderr, STDERR_FILENO);
+    close(olderr);
+
+    return nullptr;
+}
+
+void fuse_start() {
+
+    //Создаем поток fuse_thread
+    pthread_t fuse_thread;
+
+    //Запускаем в этом потоке функцию в которой fuse_main
+    //Это нужно чтобы vfs не блокировала работу шелла
+    pthread_create(&fuse_thread, nullptr, fuse_thread_function, nullptr);
 }
